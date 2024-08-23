@@ -1,4 +1,5 @@
 'use strict';
+
 import { shouldBeUseWeb } from './PlatformChecker';
 import type { Mutable } from './commonTypes';
 import { shareableMappingCache } from './shareableMappingCache';
