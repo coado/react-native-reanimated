@@ -26,6 +26,7 @@
 #include <worklets/Tools/SingleInstanceChecker.h>
 #include <worklets/Tools/UIScheduler.h>
 
+#include <react/renderer/animationbackend/AnimationBackend.h>
 #include <react/renderer/componentregistry/componentNameByReactViewName.h>
 #include <react/renderer/core/ShadowNode.h>
 #include <react/renderer/uimanager/UIManager.h>
@@ -100,6 +101,7 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
   double getCssTimestamp();
 
   void performOperations(const bool isTriggeredByEvent);
+  AnimationMutations performOperationsForBackend();
 
   void setViewStyle(jsi::Runtime &rt, const jsi::Value &viewTag, const jsi::Value &viewStyle) override;
 
@@ -183,7 +185,7 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
   std::shared_ptr<WorkletsModuleProxy> workletsModuleProxy_;
 
   std::unique_ptr<EventHandlerRegistry> eventHandlerRegistry_;
-  const RequestRenderFunction requestRender_;
+  RequestRenderFunction requestRender_;
   volatile bool renderRequested_{false};
   std::function<void(const double)> onRenderCallback_;
   AnimatedSensorModule animatedSensorModule_;
