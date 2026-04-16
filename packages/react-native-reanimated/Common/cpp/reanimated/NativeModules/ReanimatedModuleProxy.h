@@ -1,5 +1,8 @@
 #pragma once
 
+#include <react/renderer/componentregistry/componentNameByReactViewName.h>
+#include <react/renderer/core/ShadowNode.h>
+#include <react/renderer/uimanager/UIManager.h>
 #include <reanimated/AnimatedSensor/AnimatedSensorModule.h>
 #include <reanimated/CSS/core/CSSAnimation.h>
 #include <reanimated/CSS/core/CSSTransition.h>
@@ -8,6 +11,7 @@
 #include <reanimated/CSS/registries/CSSKeyframesRegistry.h>
 #include <reanimated/CSS/registries/CSSTransitionsRegistry.h>
 #include <reanimated/CSS/registries/StaticPropsRegistry.h>
+#include <reanimated/Compat/WorkletsApi.h>
 #include <reanimated/Events/UIEventHandlerRegistry.h>
 #include <reanimated/Fabric/ReanimatedCommitHook.h>
 #include <reanimated/Fabric/ReanimatedCommitShadowNode.h>
@@ -26,10 +30,10 @@
 #include <worklets/Tools/JSScheduler.h>
 #include <worklets/Tools/UIScheduler.h>
 
-#include <react/renderer/componentregistry/componentNameByReactViewName.h>
-#include <react/renderer/core/ShadowNode.h>
-#include <react/renderer/uimanager/UIManager.h>
+#include <react/renderer/animationbackend/AnimationBackend.h>
+#include <react/renderer/uimanager/UIManagerAnimationBackend.h>
 
+#include <cstdint>
 #include <memory>
 #include <set>
 #include <string>
@@ -41,13 +45,18 @@ namespace reanimated {
 using namespace facebook;
 using namespace css;
 
-using UpdatesBatch = std::vector<std::pair<std::shared_ptr<const ShadowNode>, folly::dynamic>>;
+enum class GrandCallbackState : std::uint8_t {
+  AnimationLoop,
+  Event,
+  EventInAndroidDraw,
+};
 
 class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
                               public std::enable_shared_from_this<ReanimatedModuleProxy> {
  public:
   ReanimatedModuleProxy(
-      const std::shared_ptr<WorkletsModuleProxy> &workletsModuleProxy,
+      const std::shared_ptr<worklets::WorkletRuntime> &uiRuntime,
+      const std::shared_ptr<worklets::UIScheduler> &uiScheduler,
       jsi::Runtime &rnRuntime,
       const std::shared_ptr<CallInvoker> &jsCallInvoker,
       const PlatformDepMethodsHolder &platformDepMethodsHolder,
@@ -88,12 +97,49 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
   bool
   handleEvent(const std::string &eventName, const int emitterReactTag, const jsi::Value &payload, double currentTime);
 
-  bool handleRawEvent(const RawEvent &rawEvent, double currentTime);
+  bool handleRawEvent(const RawEvent &rawEvent);
 
   void maybeRunCSSLoop();
   double getCssTimestamp();
 
   void performOperations(const bool isTriggeredByEvent);
+  AnimationMutations collectMutationsForBackend();
+  void performOperations();
+  void performNonLayoutOperations();
+  AnimationMutations collectNonLayoutMutationsForBackend();
+  void flushLayoutAnimationRequests();
+
+  template <GrandCallbackState State>
+  AnimationMutations grandCallback(AnimationTimestamp timestamp);
+
+  template <GrandCallbackState State>
+  void triggerBackendCallback() {
+#ifdef RN_HAS_PUSH_ANIMATION_MUTATIONS
+    withAnimationBackend([this](const std::shared_ptr<AnimationBackend> &backend) {
+      backend->pushAnimationMutations([this](AnimationTimestamp ts) { return grandCallback<State>(ts); });
+    });
+#else
+    withAnimationBackend([](const std::shared_ptr<AnimationBackend> &backend) { backend->trigger(); });
+#endif
+  }
+
+  template <GrandCallbackState State>
+  void handleEventAndFlush(const std::string &eventName, int emitterReactTag, const jsi::Value &payload) {
+#ifdef RN_HAS_PUSH_ANIMATION_MUTATIONS
+    withAnimationBackend([&](const std::shared_ptr<AnimationBackend> &backend) {
+      backend->pushAnimationMutations([&](AnimationTimestamp ts) {
+        handleEvent(eventName, emitterReactTag, payload, ts.count());
+        return grandCallback<State>(ts);
+      });
+    });
+#else
+    handleEvent(eventName, emitterReactTag, payload, getAnimationTimestamp_());
+    triggerBackendCallback<State>();
+#endif
+  }
+
+  void startBackendIfNeeded();
+  void stopBackendIfIdle(const AnimationMutations &mutations);
 
   void setViewStyle(jsi::Runtime &rt, const jsi::Value &viewTag, const jsi::Value &viewStyle) override;
 
@@ -103,12 +149,18 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
   void registerCSSKeyframes(
       jsi::Runtime &rt,
       const jsi::Value &animationName,
-      const jsi::Value &viewName,
+      const jsi::Value &compoundComponentName,
       const jsi::Value &keyframesConfig) override;
-  void unregisterCSSKeyframes(jsi::Runtime &rt, const jsi::Value &animationName, const jsi::Value &viewName) override;
+  void unregisterCSSKeyframes(
+      jsi::Runtime &rt,
+      const jsi::Value &animationName,
+      const jsi::Value &compoundComponentName) override;
 
-  void applyCSSAnimations(jsi::Runtime &rt, const jsi::Value &shadowNodeWrapper, const jsi::Value &animationUpdates)
-      override;
+  void applyCSSAnimations(
+      jsi::Runtime &rt,
+      const jsi::Value &shadowNodeWrapper,
+      const jsi::Value &compoundComponentName,
+      const jsi::Value &animationUpdates) override;
   void unregisterCSSAnimations(const jsi::Value &viewTag) override;
 
   void runCSSTransition(jsi::Runtime &rt, const jsi::Value &shadowNodeWrapper, const jsi::Value &transitionConfig)
@@ -155,6 +207,8 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
       const jsi::Value &isNavigationBarTranslucent) override;
   void unsubscribeFromKeyboardEvents(jsi::Runtime &rt, const jsi::Value &listenerId) override;
 
+  void toggleSlowAnimationsOnUIRuntime() const;
+
   inline LayoutAnimationsManager &layoutAnimationsManager() {
     return *layoutAnimationsManager_;
   }
@@ -163,27 +217,37 @@ class ReanimatedModuleProxy : public ReanimatedModuleProxySpec,
     return isReducedMotion_;
   }
 
-  [[nodiscard]] inline std::shared_ptr<WorkletsModuleProxy> getWorkletsModuleProxy() const {
-    return workletsModuleProxy_;
-  }
-
   void requestFlushRegistry();
   std::function<std::string()> createRegistriesLeakCheck();
 
  private:
+  template <typename Func>
+  void withAnimationBackend(Func &&fn) {
+    auto weak = uiManager_->unstable_getAnimationBackend();
+    if (auto locked = weak.lock()) {
+      fn(std::static_pointer_cast<AnimationBackend>(locked));
+    }
+  }
+
   void commitUpdates(jsi::Runtime &rt, const UpdatesBatch &updatesBatch);
+  void applySynchronousUpdates(UpdatesBatch &updatesBatch, bool allowPartialUpdates = false);
 
   const bool isReducedMotion_;
   bool shouldFlushRegistry_ = false;
-  std::shared_ptr<WorkletsModuleProxy> workletsModuleProxy_;
+  std::shared_ptr<worklets::WorkletRuntime> uiRuntime_;
+  std::shared_ptr<worklets::UIScheduler> uiScheduler_;
 
   std::unique_ptr<UIEventHandlerRegistry> eventHandlerRegistry_;
-  const RequestRenderFunction requestRender_;
+  RequestRenderFunction requestRender_;
   volatile bool renderRequested_{false};
+  bool isAnimationRunning_{false};
+  CallbackId callbackId_;
   std::function<void(const double)> onRenderCallback_;
   AnimatedSensorModule animatedSensorModule_;
   std::shared_ptr<LayoutAnimationsManager> layoutAnimationsManager_;
   GetAnimationTimestampFunction getAnimationTimestamp_;
+  std::function<void(double)> pendingAnimationFrameCallback_;
+
 #ifdef __APPLE__
   ForceScreenSnapshotFunction forceScreenSnapshot_;
 #endif

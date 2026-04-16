@@ -1,3 +1,4 @@
+#import <reanimated/Tools/FeatureFlags.h>
 #import <reanimated/Tools/PlatformDepMethodsHolder.h>
 #import <reanimated/apple/REAAssertJavaScriptQueue.h>
 #import <reanimated/apple/REAReducedMotion.h>
@@ -13,42 +14,64 @@ namespace reanimated {
 
 using namespace facebook;
 using namespace react;
+using namespace worklets;
 
 std::shared_ptr<ReanimatedModuleProxy> createReanimatedModuleProxy(
     REANodesManager *nodesManager,
     RCTModuleRegistry *moduleRegistry,
     jsi::Runtime &rnRuntime,
     const std::shared_ptr<CallInvoker> &jsInvoker,
-    WorkletsModule *workletsModule)
+    const std::shared_ptr<WorkletRuntime> &uiWorkletRuntime,
+    const std::shared_ptr<UIScheduler> &uiScheduler)
 {
   REAAssertJavaScriptQueue();
 
   PlatformDepMethodsHolder platformDepMethodsHolder = makePlatformDepMethodsHolder(moduleRegistry, nodesManager);
 
-  const auto workletsModuleProxy = [workletsModule getWorkletsModuleProxy];
-
   auto reanimatedModuleProxy = std::make_shared<ReanimatedModuleProxy>(
-      workletsModuleProxy, rnRuntime, jsInvoker, platformDepMethodsHolder, getIsReducedMotion());
+      uiWorkletRuntime, uiScheduler, rnRuntime, jsInvoker, platformDepMethodsHolder, getIsReducedMotion());
   reanimatedModuleProxy->init(platformDepMethodsHolder);
 
-  jsi::Runtime &uiRuntime = workletsModuleProxy->getUIWorkletRuntime()->getJSIRuntime();
+  auto &uiRuntime = getJSIRuntimeFromWorkletRuntime(uiWorkletRuntime);
 
-  [nodesManager registerEventHandler:^(id<RCTEvent> event) {
-    // handles RCTEvents from RNGestureHandler
-    std::string eventName = [event.eventName UTF8String];
-    int emitterReactTag = [event.viewTag intValue];
-    id eventData = [event arguments][2];
-    jsi::Value payload = convertObjCObjectToJSIValue(uiRuntime, eventData);
-    double currentTime = CACurrentMediaTime() * 1000;
-    reanimatedModuleProxy->handleEvent(eventName, emitterReactTag, payload, currentTime);
-  }];
+  if constexpr (StaticFeatureFlags::getFlag("USE_ANIMATION_BACKEND")) {
+    // Backend path: single dispatch handler that calls handleEventAndFlush.
+    // Both event handling and mutation flushing happen inside one
+    // pushAnimationMutations call, so there's a single timestamp source.
+    [nodesManager registerDispatchEventHandler:^(id<RCTEvent> event) {
+      std::string eventName = [event.eventName UTF8String];
+      int emitterReactTag = [event.viewTag intValue];
+      id eventData = [event arguments][2];
+      jsi::Value payload = convertObjCObjectToJSIValue(uiRuntime, eventData);
+      reanimatedModuleProxy->handleEventAndFlush<GrandCallbackState::Event>(
+          eventName, emitterReactTag, payload);
+    }];
+  } else {
+    // Non-backend path: separate event handler + performOperations blocks.
+    [nodesManager registerEventHandler:^(id<RCTEvent> event) {
+      std::string eventName = [event.eventName UTF8String];
+      int emitterReactTag = [event.viewTag intValue];
+      id eventData = [event arguments][2];
+      jsi::Value payload = convertObjCObjectToJSIValue(uiRuntime, eventData);
+      double currentTime = CACurrentMediaTime() * 1000;
+      reanimatedModuleProxy->handleEvent(eventName, emitterReactTag, payload, currentTime);
+    }];
+  }
 
   std::weak_ptr<ReanimatedModuleProxy> weakReanimatedModuleProxy = reanimatedModuleProxy; // to avoid retain cycle
   [nodesManager registerPerformOperations:^() {
     if (auto reanimatedModuleProxy = weakReanimatedModuleProxy.lock()) {
-      reanimatedModuleProxy->performOperations(false);
+      reanimatedModuleProxy->performOperations();
     }
   }];
+
+  if constexpr (!StaticFeatureFlags::getFlag("USE_ANIMATION_BACKEND")) {
+    [nodesManager registerPerformOperationsForEvent:^() {
+      if (auto reanimatedModuleProxy = weakReanimatedModuleProxy.lock()) {
+        reanimatedModuleProxy->performOperations();
+      }
+    }];
+  }
 
   return reanimatedModuleProxy;
 }

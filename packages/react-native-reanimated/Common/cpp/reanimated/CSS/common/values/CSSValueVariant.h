@@ -82,7 +82,7 @@ class CSSValueVariant final : public CSSValue {
   explicit CSSValueVariant(const folly::dynamic &value);
 
   bool operator==(const CSSValueVariant &other) const;
-  bool operator==(const CSSValue &other) const;
+  bool operator==(const CSSValue &other) const override;
 
   folly::dynamic toDynamic() const override;
   std::string toString() const override;
@@ -100,6 +100,9 @@ class CSSValueVariant final : public CSSValue {
       const double progress,
       const CSSValueVariant &to,
       const ResolvableValueInterpolationContext &context) const;
+
+  std::variant<AllowedTypes...> getStorage() const;
+  const std::variant<AllowedTypes...> &getStorageRef() const;
 
  private:
   std::variant<AllowedTypes...> storage_;

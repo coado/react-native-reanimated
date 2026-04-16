@@ -1,18 +1,40 @@
 #include <reanimated/Fabric/updates/AnimatedPropsRegistry.h>
+#include <reanimated/Fabric/updates/propsLayoutFilter.h>
 #include <reanimated/Tools/FeatureFlags.h>
+
+#include <react/renderer/animationbackend/AnimatedPropsBuilder.h>
 
 #include <memory>
 #include <utility>
 
 namespace reanimated {
 
-#if REACT_NATIVE_MINOR_VERSION >= 81
+namespace {
+
+bool hasLayoutPropsInObject(jsi::Runtime &rt, jsi::Object &obj) {
+  jsi::Array names = obj.getPropertyNames(rt);
+  const size_t n = names.size(rt);
+  for (size_t ki = 0; ki < n; ++ki) {
+    jsi::Value keyVal = names.getValueAtIndex(rt, ki);
+    if (!keyVal.isString()) {
+      continue;
+    }
+    const auto keyStr = keyVal.asString(rt).utf8(rt);
+    const auto propName = propNameFromString(keyStr);
+    if (propName.has_value() && isLayoutProp(propName.value())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 static inline std::shared_ptr<const ShadowNode> shadowNodeFromValue(
     jsi::Runtime &rt,
     const jsi::Value &shadowNodeWrapper) {
   return Bridging<std::shared_ptr<const ShadowNode>>::fromJs(rt, shadowNodeWrapper);
 }
-#endif
 
 void AnimatedPropsRegistry::update(jsi::Runtime &rt, const jsi::Value &operations, const double timestamp) {
   auto operationsArray = operations.asObject(rt).asArray(rt);
@@ -22,8 +44,22 @@ void AnimatedPropsRegistry::update(jsi::Runtime &rt, const jsi::Value &operation
     auto shadowNodeWrapper = item.getProperty(rt, "shadowNodeWrapper");
     auto shadowNode = shadowNodeFromValue(rt, shadowNodeWrapper);
 
-    const jsi::Value &updates = item.getProperty(rt, "updates");
-    addUpdatesToBatch(shadowNode, jsi::dynamicFromValue(rt, updates));
+    jsi::Value updates = item.getProperty(rt, "updates");
+
+    if constexpr (StaticFeatureFlags::getFlag("USE_ANIMATION_BACKEND")) {
+      if (!updates.isObject()) {
+        continue;
+      }
+      jsi::Value updatesOwned(rt, updates);
+      auto updatesObj = updatesOwned.asObject(rt);
+      const bool hasLayoutUpdates = hasLayoutPropsInObject(rt, updatesObj);
+      AnimatedPropsBuilder builder;
+      builder.storeJSI(rt, updatesOwned);
+      addAnimatedPropsToBatch(shadowNode, builder.get(), hasLayoutUpdates);
+    } else {
+      auto dynamic = jsi::dynamicFromValue(rt, updates);
+      addUpdatesToBatch(shadowNode->getFamilyShared(), dynamic);
+    }
 
     if constexpr (StaticFeatureFlags::getFlag("FORCE_REACT_RENDER_FOR_SETTLED_ANIMATIONS")) {
       timestampMap_[shadowNode->getTag()] = timestamp;

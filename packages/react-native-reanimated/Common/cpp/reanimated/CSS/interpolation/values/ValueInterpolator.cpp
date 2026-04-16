@@ -1,3 +1,6 @@
+#include <reanimated/CSS/common/values/CSSKeyword.h>
+#include <reanimated/CSS/common/values/CSSLength.h>
+#include <reanimated/CSS/common/values/CSSValueVariant.h>
 #include <reanimated/CSS/interpolation/values/ValueInterpolator.h>
 
 #include <memory>
@@ -8,10 +11,12 @@ namespace reanimated::css {
 ValueInterpolator::ValueInterpolator(
     const PropertyPath &propertyPath,
     const std::shared_ptr<CSSValue> &defaultValue,
-    const std::shared_ptr<ViewStylesRepository> &viewStylesRepository)
+    const std::shared_ptr<ViewStylesRepository> &viewStylesRepository,
+    std::function<void(const std::shared_ptr<AnimatedPropsBuilder> &, const CSSValue &)> addToPropsBuilder)
     : PropertyInterpolator(propertyPath, viewStylesRepository),
       defaultStyleValue_(defaultValue),
-      defaultStyleValueDynamic_(defaultValue->toDynamic()) {}
+      defaultStyleValueDynamic_(defaultValue->toDynamic()),
+      addToPropsBuilder_(addToPropsBuilder) {}
 
 folly::dynamic ValueInterpolator::getStyleValue(const std::shared_ptr<const ShadowNode> &shadowNode) const {
   return viewStylesRepository_->getStyleProp(shadowNode->getTag(), propertyPath_);
@@ -50,40 +55,22 @@ void ValueInterpolator::updateKeyframes(jsi::Runtime &rt, const jsi::Value &keyf
   }
 }
 
-bool ValueInterpolator::updateKeyframesFromStyleChange(
-    const folly::dynamic &oldStyleValue,
-    const folly::dynamic &newStyleValue,
-    const folly::dynamic &lastUpdateValue) {
-  ValueKeyframe firstKeyframe, lastKeyframe;
+bool ValueInterpolator::updateKeyframes(jsi::Runtime &rt, const jsi::Value &fromValue, const jsi::Value &toValue) {
+  auto from = fromValue.isUndefined() ? defaultStyleValue_ : createValue(rt, fromValue);
+  auto to = toValue.isUndefined() ? defaultStyleValue_ : createValue(rt, toValue);
 
-  if (!lastUpdateValue.isNull()) {
-    firstKeyframe = ValueKeyframe{0, createValue(lastUpdateValue)};
-  } else if (!oldStyleValue.isNull()) {
-    firstKeyframe = ValueKeyframe{0, createValue(oldStyleValue)};
-  } else {
-    firstKeyframe = ValueKeyframe{0, defaultStyleValue_};
-  }
+  const auto equalsReversingAdjustedStartValue = reversingAdjustedStartValue_ && (*to == *reversingAdjustedStartValue_);
+  reversingAdjustedStartValue_ = keyframes_.empty() ? from : keyframes_[1].value.value();
 
-  if (newStyleValue.isNull()) {
-    lastKeyframe = ValueKeyframe{1, defaultStyleValue_};
-  } else {
-    lastKeyframe = ValueKeyframe{1, createValue(newStyleValue)};
-  }
+  keyframes_ = {ValueKeyframe{0, std::move(from)}, ValueKeyframe{1, std::move(to)}};
 
-  keyframes_ = {std::move(firstKeyframe), std::move(lastKeyframe)};
-
-  // Check if new value equals the reversing adjusted start value
-  bool isEqual =
-      reversingAdjustedStartValue_.isNull() ? newStyleValue.isNull() : (reversingAdjustedStartValue_ == newStyleValue);
-
-  reversingAdjustedStartValue_ = oldStyleValue;
-
-  return isEqual;
+  return equalsReversingAdjustedStartValue;
 }
 
 folly::dynamic ValueInterpolator::interpolate(
     const std::shared_ptr<const ShadowNode> &shadowNode,
     const std::shared_ptr<KeyframeProgressProvider> &progressProvider,
+    const std::shared_ptr<AnimatedPropsBuilder> &propsBuilder,
     const double fallbackInterpolateThreshold) const {
   const auto toIndex = getToKeyframeIndex(progressProvider);
   const auto fromIndex = toIndex - 1;
@@ -103,9 +90,11 @@ folly::dynamic ValueInterpolator::interpolate(
   const auto keyframeProgress = progressProvider->getKeyframeProgress(fromKeyframe.offset, toKeyframe.offset);
 
   if (keyframeProgress == 1.0) {
+    addToPropsBuilder_(propsBuilder, *toValue);
     return toValue->toDynamic();
   }
   if (keyframeProgress == 0.0) {
+    addToPropsBuilder_(propsBuilder, *fromValue);
     return fromValue->toDynamic();
   }
 
@@ -113,7 +102,8 @@ folly::dynamic ValueInterpolator::interpolate(
       keyframeProgress,
       fromValue,
       toValue,
-      {.node = shadowNode, .fallbackInterpolateThreshold = fallbackInterpolateThreshold});
+      {.node = shadowNode, .fallbackInterpolateThreshold = fallbackInterpolateThreshold},
+      propsBuilder);
 }
 
 folly::dynamic ValueInterpolator::convertOptionalToDynamic(

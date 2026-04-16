@@ -1,5 +1,6 @@
 #pragma once
 
+#include <react/renderer/animationbackend/AnimatedPropsBuilder.h>
 #include <reanimated/CSS/common/definitions.h>
 #include <reanimated/CSS/common/values/CSSValue.h>
 #include <reanimated/CSS/misc/ViewStylesRepository.h>
@@ -25,14 +26,12 @@ class PropertyInterpolator {
   virtual folly::dynamic getLastKeyframeValue() const = 0;
 
   virtual void updateKeyframes(jsi::Runtime &rt, const jsi::Value &keyframes) = 0;
-  virtual bool updateKeyframesFromStyleChange(
-      const folly::dynamic &oldStyleValue,
-      const folly::dynamic &newStyleValue,
-      const folly::dynamic &lastUpdateValue) = 0;
+  virtual bool updateKeyframes(jsi::Runtime &rt, const jsi::Value &fromValue, const jsi::Value &toValue) = 0;
 
   virtual folly::dynamic interpolate(
       const std::shared_ptr<const ShadowNode> &shadowNode,
       const std::shared_ptr<KeyframeProgressProvider> &progressProvider,
+      const std::shared_ptr<AnimatedPropsBuilder> &propsBuilder,
       double fallbackInterpolateThreshold) const = 0;
 
  protected:
